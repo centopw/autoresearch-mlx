@@ -17,11 +17,12 @@ import argparse
 import pickle
 from multiprocessing import Pool
 
+import numpy as np
 import requests
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
-import torch
+import mlx.core as mx
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -143,7 +144,9 @@ def train_tokenizer():
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
     token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
+    # Support both old .pt and new .npy token_bytes files
+    token_bytes_npy = token_bytes_path.replace(".pt", ".npy")
+    if os.path.exists(tokenizer_pkl) and (os.path.exists(token_bytes_npy) or os.path.exists(token_bytes_path)):
         print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
         return
 
@@ -191,9 +194,10 @@ def train_tokenizer():
             token_bytes_list.append(0)
         else:
             token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    token_bytes_arr = np.array(token_bytes_list, dtype=np.int32)
+    token_bytes_npy = token_bytes_path.replace(".pt", ".npy")
+    np.save(token_bytes_npy, token_bytes_arr)
+    print(f"Tokenizer: saved token_bytes to {token_bytes_npy}")
 
     # Sanity check
     test = "Hello world! Numbers: 123. Unicode: 你好"
@@ -245,10 +249,15 @@ class Tokenizer:
         return self.enc.decode(ids)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def get_token_bytes():
+    npy_path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
+    if os.path.exists(npy_path):
+        return mx.array(np.load(npy_path))
+    # Fallback: old torch .pt format (requires torch installed)
+    pt_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    import torch
+    with open(pt_path, "rb") as f:
+        return mx.array(np.array(torch.load(f, map_location="cpu")))
 
 
 def _document_batches(split, tokenizer_batch_size=128):
@@ -293,14 +302,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    # CPU numpy staging buffer
+    row_buffer = np.empty((B, row_capacity), dtype=np.int32)
 
     while True:
         for row_idx in range(B):
@@ -322,25 +325,23 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + len(doc)] = doc
                     pos += len(doc)
                 else:
                     # No doc fits — crop shortest to fill remaining
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + remaining] = doc[:remaining]
                     pos += remaining
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        inputs = mx.array(row_buffer[:, :-1])
+        targets = mx.array(row_buffer[:, 1:])
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
 def evaluate_bpb(model, tokenizer, batch_size):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
@@ -349,19 +350,21 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes()
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
         x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
+        loss_flat = model(x, y, reduction='none').reshape(-1)
+        y_flat = y.reshape(-1)
         nbytes = token_bytes[y_flat]
         mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
+        nats = mx.sum(loss_flat * mask)
+        mx.eval(nats, nbytes)
+        total_nats += nats.item()
+        total_bytes += int(mx.sum(nbytes).item())
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
